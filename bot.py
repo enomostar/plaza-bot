@@ -18,7 +18,7 @@ DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
     "https://discord.com/api/webhooks/1482270962945622196/5he_R80obGgeguYS54iJylePo0XLN-EtSGtuDN1U2d537jnVW4Z8i2suL0W4mddedlLV"
 )
-API_URL = "https://mosaic-plaza-aanbodapi.zig365.nl/api/v1/actueel-aanbod?limit=60&locale=en_GB&page=0&sort=%2BreactionData.aangepasteTotaleHuurprijs"
+API_URL = "https://mosaic-plaza-aanbodapi.zig365.nl/api/v1/actueel-aanbod?limit=500&locale=en_GB&page=0&sort=%2BreactionData.aangepasteTotaleHuurprijs"
 CHECK_INTERVAL_SECONDS = 30
 SEEN_IDS_FILE = "/data/seen_plaza.json"
 # ─────────────────────────────────────────────
