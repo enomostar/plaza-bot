@@ -1,6 +1,6 @@
 """
-Plaza (newnewnew.space) → Discord notifier — Enschede only
-Requires: pip install playwright requests && python -m playwright install chromium
+Plaza (newnewnew.space) → Discord notifier — Enschede only (API-based)
+Requires: pip install requests
 """
 
 import json
@@ -10,35 +10,54 @@ import time
 from datetime import datetime, timezone
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────
 DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
-    "https://discord.com/api/webhooks/1482295315653722215/lMdBztZUhDFhB3TxcpCCAbz4qBcfTLwmg7Qapkaais5_qWMtPF-BWn0GMzuM50JJDpqs"
+    "https://discord.com/api/webhooks/1482270962945622196/5he_R80obGgeguYS54iJylePo0XLN-EtSGtuDN1U2d537jnVW4Z8i2suL0W4mddedlLV"
 )
-PLAZA_URL = "https://plaza.newnewnew.space/en/availables-places/living-place"
-FILTER_CITY = "enschede"           # only notify for listings containing this word
+API_URL = "https://mosaic-plaza-aanbodapi.zig365.nl/api/v1/actueel-aanbod?limit=60&locale=en_GB&page=0&sort=%2BreactionData.aangepasteTotaleHuurprijs"
 CHECK_INTERVAL_SECONDS = 30
 SEEN_IDS_FILE = "/data/seen_plaza.json"
 # ─────────────────────────────────────────────
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json",
+    "Referer": "https://plaza.newnewnew.space/en/availables-places/living-place",
+    "Origin": "https://plaza.newnewnew.space",
+}
+
+# Filter to Enschede only (municipality ID 15897, region Overijssel 9, Netherlands 524)
+API_PAYLOAD = {
+    "filters": {
+        "$and": [
+            {
+                "$and": [
+                    {"municipality.id": {"$eq": "15897"}},
+                    {"regio.id": {"$eq": "9"}},
+                    {"land.id": {"$eq": "524"}},
+                ]
+            }
+        ]
+    },
+    "hidden-filters": {
+        "$and": [
+            {"dwellingType.categorie": {"$eq": "woning"}},
+            {"rentBuy": {"$eq": "Huur"}},
+            {"isExtraAanbod": {"$eq": ""}},
+            {"isWoningruil": {"$eq": ""}},
+        ]
+    },
+}
+
 
 def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def clean(text: str, max_len: int = 256) -> str:
-    text = (text or "").strip()
-    text = "".join(c for c in text if c.isprintable())
-    return text[:max_len] if text else ""
-
-
-def find_price_in_text(text: str) -> str:
-    match = re.search(r"€\s*[\d.,]+(?:\s*/\s*(?:mnd|maand|month|mo))?", text, re.IGNORECASE)
-    return match.group(0).strip() if match else ""
 
 
 def load_seen_ids() -> set:
@@ -57,226 +76,128 @@ def save_seen_ids(seen_ids: set) -> None:
 
 def fetch_listings() -> list[dict]:
     listings = []
-
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 800},
-                locale="en-US",
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            )
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
+        resp = requests.post(API_URL, headers=HEADERS, json=API_PAYLOAD, timeout=15)
+        if resp.status_code != 200:
+            print(f"[{now()}] ❌  API returned {resp.status_code}")
+            return []
 
-            page = context.new_page()
-            page.goto(PLAZA_URL, wait_until="domcontentloaded", timeout=45000)
-            time.sleep(4)
+        data = resp.json()
+        items = data.get("data", [])
+        print(f"[{now()}] 📦  API returned {len(items)} Enschede listings")
 
-            # Dismiss cookie banner if present
+        for item in items:
             try:
-                page.click(
-                    "button:has-text('Accept'), button:has-text('Agree'), "
-                    "button:has-text('OK'), [id*='cookie'] button, [class*='cookie'] button",
-                    timeout=4000,
-                )
-                print(f"[{now()}] 🍪  Cookie banner dismissed.")
-                time.sleep(1)
-            except PlaywrightTimeout:
-                pass
-
-            # Wait for listing cards
-            SELECTORS = [
-                "a[href*='/living-place/']",
-                "a[href*='/available']",
-                "[class*='listing']",
-                "[class*='property']",
-                "[class*='card']",
-                "[class*='place']",
-                "article",
-            ]
-
-            found_selector = None
-            for sel in SELECTORS:
-                try:
-                    page.wait_for_selector(sel, timeout=8000)
-                    found_selector = sel
-                    break
-                except PlaywrightTimeout:
+                listing_id = str(item.get("id", ""))
+                if not listing_id:
                     continue
 
-            if not found_selector:
-                print(f"[{now()}] ⚠️  No listing cards found — saving debug_plaza.html")
-                with open("debug_plaza.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                browser.close()
-                return []
+                street   = item.get("street", "")
+                number   = item.get("houseNumber", "")
+                addition = item.get("houseNumberAddition", "")
 
-            # Grab all anchor tags that link to individual listings
-            all_links = page.query_selector_all("a[href*='/living-place/'], a[href*='/place/']")
-            if not all_links:
-                all_links = page.query_selector_all("a[href]")
-
-            seen_hrefs: set = set()
-
-            for card in all_links:
-                href = card.get_attribute("href") or ""
-                if not href or href == PLAZA_URL or href.endswith("/living-place"):
-                    continue
-
-                # Build full URL
-                if href.startswith("http"):
-                    full_url = href
-                elif href.startswith("/"):
-                    full_url = "https://plaza.newnewnew.space" + href
+                # City
+                city = ""
+                if isinstance(item.get("city"), dict):
+                    city = item["city"].get("name", "")
                 else:
-                    continue
+                    city = item.get("city", "")
 
-                # Use the last URL segment as ID
-                listing_id = full_url.rstrip("/").split("/")[-1]
-                if not listing_id or listing_id in seen_hrefs:
-                    continue
-                seen_hrefs.add(listing_id)
+                postal = item.get("postalcode", "")
 
-                full_text = clean(card.inner_text(), 2000)
+                title_parts = [p for p in [street, number, addition] if p]
+                title = " ".join(title_parts)
+                if postal or city:
+                    title += f", {postal} {city}".strip()
 
-                # ── City filter — skip if not Enschede ──────────────────
-                if FILTER_CITY.lower() not in full_text.lower() and FILTER_CITY.lower() not in full_url.lower():
-                    continue
+                # Price
+                if item.get("totalRent"):
+                    price = f"€{float(item['totalRent']):.2f} /mnd"
+                elif item.get("netRent"):
+                    price = f"€{float(item['netRent']):.2f} /mnd"
+                else:
+                    price = "—"
 
-                # ── Title ────────────────────────────────────────────────
-                title = ""
-                for sel in ["h2", "h3", "h4", "[class*='title']", "[class*='name']",
-                            "[class*='street']", "[class*='address']", "strong"]:
-                    el = card.query_selector(sel)
-                    if el:
-                        t = clean(el.inner_text(), 256)
-                        if t:
-                            title = t
-                            break
-                if not title:
-                    # fallback: parse from URL slug
-                    slug = re.sub(r"^\d+-", "", listing_id)
-                    title = slug.replace("-", " ").title()
+                # Area
+                area = f"{item['areaDwelling']} m²" if item.get("areaDwelling") else "—"
 
-                # ── Price ────────────────────────────────────────────────
-                price = ""
-                for sel in ["[class*='price']", "[class*='rent']", "[class*='huur']",
-                            "[class*='cost']", "[class*='bedrag']", "[class*='prijs']"]:
-                    el = card.query_selector(sel)
-                    if el:
-                        p = clean(el.inner_text(), 100)
-                        if p and "€" in p:
-                            price = p
-                            break
-                if not price:
-                    price = find_price_in_text(full_text)
-
-                # ── Location ─────────────────────────────────────────────
-                location = ""
-                for sel in ["[class*='location']", "[class*='city']", "[class*='place']",
-                            "[class*='address']", "[class*='stad']"]:
-                    el = card.query_selector(sel)
-                    if el:
-                        loc = clean(el.inner_text(), 100)
-                        if loc:
-                            location = loc
-                            break
-                if not location:
-                    location = "Enschede"
-
-                # ── Type ─────────────────────────────────────────────────
+                # Type
                 prop_type = ""
-                for sel in ["[class*='type']", "[class*='kind']", "[class*='category']",
-                            "[class*='label']", "[class*='tag']", "[class*='badge']"]:
-                    el = card.query_selector(sel)
-                    if el:
-                        t = clean(el.inner_text(), 60)
-                        if t:
-                            prop_type = t
-                            break
+                if isinstance(item.get("dwellingType"), dict):
+                    prop_type = item["dwellingType"].get("name", "") or item["dwellingType"].get("localizedName", "")
                 if not prop_type:
-                    type_match = re.search(
-                        r"\b(kamer|studio|appartement|apartment|room|flat|house|loft)\b",
-                        full_text, re.IGNORECASE
-                    )
-                    if type_match:
-                        prop_type = type_match.group(0).capitalize()
+                    prop_type = item.get("objectType", "—")
 
-                # ── Image ─────────────────────────────────────────────────
-                image = None
-                for img_el in card.query_selector_all("img"):
-                    src = (
-                        img_el.get_attribute("src")
-                        or img_el.get_attribute("data-src")
-                        or img_el.get_attribute("data-lazy-src")
-                    )
-                    if src and src.startswith("http") and not src.endswith(".svg"):
-                        image = src
-                        break
+                # Floor
+                floor = ""
+                if isinstance(item.get("floor"), dict):
+                    floor = item["floor"].get("name", "")
+
+                # Image
+                img_url = ""
+                pics = item.get("pictures", [])
+                if pics and isinstance(pics[0], dict):
+                    img_url = pics[0].get("url") or pics[0].get("uri") or ""
+                if img_url and not img_url.startswith("http"):
+                    img_url = "https://plaza.newnewnew.space" + img_url
+
+                # Build listing URL
+                cleaned = re.sub(r"[^a-z0-9]", "-", title.lower())
+                cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+                link = f"https://plaza.newnewnew.space/en/availables-places/living-place/details/{listing_id}"
+                if cleaned:
+                    link += f"-{cleaned}"
+
+                if not title.strip():
+                    continue
 
                 listings.append({
                     "id": listing_id,
                     "title": title,
                     "price": price,
-                    "location": location,
+                    "area": area,
                     "type": prop_type,
-                    "url": full_url,
-                    "image": image,
+                    "floor": floor,
+                    "location": f"{postal} {city}".strip() or "Enschede",
+                    "url": link,
+                    "image": img_url,
                 })
 
-            browser.close()
-            print(f"[{now()}] 📍  Found {len(listings)} Enschede listing(s) on Plaza.")
+            except Exception as e:
+                print(f"[{now()}] ⚠️  Skipped listing: {e}")
+                continue
 
     except Exception as e:
-        print(f"[{now()}] ❌  Browser error: {e}")
+        print(f"[{now()}] ❌  API error: {e}")
 
     return listings
 
 
 def send_discord_notification(listing: dict) -> None:
-    title     = clean(listing.get("title", ""), 256) or "—"
-    price     = clean(listing.get("price", ""), 100) or "—"
-    location  = clean(listing.get("location", ""), 100) or "—"
-    prop_type = clean(listing.get("type", ""), 60) or "—"
-    url       = (listing.get("url") or "").strip()
-    if not url.startswith("http"):
-        url = "https://plaza.newnewnew.space"
+    fields = [
+        {"name": "💶 Price",    "value": listing["price"] or "—",    "inline": True},
+        {"name": "📐 Area",     "value": listing["area"] or "—",     "inline": True},
+        {"name": "🏷️ Type",    "value": listing["type"] or "—",     "inline": True},
+        {"name": "📍 Location", "value": listing["location"] or "—", "inline": True},
+    ]
+    if listing.get("floor"):
+        fields.append({"name": "🏢 Floor", "value": listing["floor"], "inline": True})
 
     embed = {
-        "title": title,
-        "url": url,
-        "color": 0xE67E22,   # orange to distinguish from Roomspot
-        "fields": [
-            {"name": "💶 Price",    "value": price,     "inline": True},
-            {"name": "📍 Location", "value": location,  "inline": True},
-            {"name": "🏷️ Type",    "value": prop_type, "inline": True},
-        ],
+        "title": listing["title"][:256],
+        "url": listing["url"],
+        "color": 0xE67E22,  # orange to distinguish from Roomspot
+        "fields": fields,
         "footer": {"text": "Plaza Notifier • Enschede"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    image_url = listing.get("image") or ""
-    if image_url.startswith("http"):
-        embed["image"] = {"url": image_url}
+    if listing.get("image", "").startswith("http"):
+        embed["image"] = {"url": listing["image"]}
 
-    payload = {"content": "🏠 **New listing on Plaza (Enschede)!**", "embeds": [embed]}
+    payload = {"content": "🏢 **New listing on Plaza (Enschede)!**", "embeds": [embed]}
 
-    for attempt in range(5):
+    for _ in range(5):
         try:
             resp = requests.post(
                 DISCORD_WEBHOOK_URL,
@@ -294,18 +215,16 @@ def send_discord_notification(listing: dict) -> None:
                 return
             else:
                 resp.raise_for_status()
-                print(f"[{now()}] ✅  Sent: {title} | {price} | {location}")
+                print(f"[{now()}] ✅  Sent: {listing['title']} | {listing['price']}")
                 return
         except requests.RequestException as e:
             print(f"[{now()}] ❌  Webhook error: {e}")
             return
 
-    print(f"[{now()}] ❌  Gave up after 5 retries: {title}")
-
 
 def main() -> None:
-    print(f"[{now()}] 🚀  Plaza notifier started (interval: {CHECK_INTERVAL_SECONDS}s, city: {FILTER_CITY})")
-    print(f"[{now()}] 🔗  URL: {PLAZA_URL}")
+    print(f"[{now()}] 🚀  Plaza API notifier started (interval: {CHECK_INTERVAL_SECONDS}s, Enschede only)")
+    print(f"[{now()}] 🔗  API: {API_URL}")
 
     seen_ids = load_seen_ids()
 
